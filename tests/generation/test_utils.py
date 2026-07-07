@@ -118,6 +118,79 @@ def is_moe_model(config):
     return getattr(config, "_experts_implementation", None) is not None
 
 
+class BeamSearchPrefillTest(unittest.TestCase):
+    @require_torch
+    @pytest.mark.generate
+    def test_prefill_runs_once_per_original_batch_item(self):
+        class BaselineGPT2LMHeadModel(GPT2LMHeadModel):
+            @staticmethod
+            def _expand_inputs_for_generation(*args, **kwargs):
+                return GPT2LMHeadModel._expand_inputs_for_generation(*args, **kwargs)
+
+        set_seed(0)
+        config = AutoConfig.for_model(
+            "gpt2",
+            vocab_size=32,
+            n_positions=16,
+            n_embd=16,
+            n_layer=1,
+            n_head=2,
+            bos_token_id=1,
+            eos_token_id=None,
+            pad_token_id=0,
+        )
+        model = GPT2LMHeadModel(config).to(torch_device).eval()
+        baseline_model = BaselineGPT2LMHeadModel(config).to(torch_device).eval()
+        baseline_model.load_state_dict(model.state_dict())
+        input_ids = torch.tensor(
+            [
+                [0, 0, 1, 2],
+                [0, 1, 3, 4],
+                [1, 5, 6, 7],
+            ],
+            device=torch_device,
+        )
+        attention_mask = input_ids.ne(0).long()
+
+        def generate_and_record(current_model):
+            forward_shapes = []
+            handle = current_model.register_forward_pre_hook(
+                lambda _, args, model_kwargs: forward_shapes.append(tuple(model_kwargs["input_ids"].shape)),
+                with_kwargs=True,
+            )
+            try:
+                output = current_model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=2,
+                    num_beams=4,
+                    use_cache=True,
+                    output_scores=True,
+                    output_logits=True,
+                    return_dict_in_generate=True,
+                )
+            finally:
+                handle.remove()
+            return output, forward_shapes
+
+        output, forward_shapes = generate_and_record(model)
+        baseline_output, baseline_shapes = generate_and_record(baseline_model)
+
+        self.assertEqual(forward_shapes[:2], [(3, 4), (12, 1)])
+        self.assertEqual(baseline_shapes[:2], [(12, 4), (12, 1)])
+        self.assertEqual(output.logits[0].shape[0], 12)
+        self.assertEqual(output.scores[0].shape[0], 12)
+        self.assertTrue(torch.equal(output.sequences, baseline_output.sequences))
+        for output_scores, baseline_scores in zip(output.scores, baseline_output.scores):
+            torch.testing.assert_close(output_scores, baseline_scores, rtol=1e-6, atol=1e-7)
+        for output_logits, baseline_logits in zip(output.logits, baseline_output.logits):
+            torch.testing.assert_close(output_logits, baseline_logits, rtol=1e-6, atol=1e-7)
+        self.assertEqual(
+            output.past_key_values.get_seq_length(),
+            baseline_output.past_key_values.get_seq_length(),
+        )
+
+
 class GenerationTesterMixin(ExportGenerateTesterMixin):
     input_name = "input_ids"
     model_tester = None

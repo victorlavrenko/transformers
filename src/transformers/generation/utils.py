@@ -3327,12 +3327,31 @@ class GenerationMixin(ContinuousMixin):
         )
         beam_indices = running_beam_indices.detach().clone()
 
+        shared_prefill = (
+            not self.training
+            and not self.config.is_encoder_decoder
+            and not output_attentions
+            and not output_hidden_states
+            and model_kwargs["use_cache"]
+            and type(self)._expand_inputs_for_generation is GenerationMixin._expand_inputs_for_generation
+            and isinstance(model_kwargs.get("past_key_values"), DynamicCache)
+            and model_kwargs["past_key_values"].get_seq_length() == 0
+        )
+        prefill_input_ids = input_ids
+        prefill_model_kwargs = model_kwargs
+        if shared_prefill:
+            prefill_input_ids = input_ids[::num_beams]
+            prefill_model_kwargs = {
+                key: value[::num_beams] if isinstance(value, torch.Tensor) else value
+                for key, value in model_kwargs.items()
+            }
+
         flat_running_sequences = input_ids
         prefill_consumed = False
         model_outputs = self._prefill(
-            input_ids,
+            prefill_input_ids,
             generation_config,
-            model_kwargs,
+            prefill_model_kwargs,
             is_first_iteration=not generation_config.is_assistant,
         )
 
@@ -3359,6 +3378,8 @@ class GenerationMixin(ContinuousMixin):
 
             # Copy is needed to avoid keeping a hanging ref
             logits = model_outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            if shared_prefill:
+                logits = logits.repeat_interleave(num_beams, dim=0)
 
             # b. Compute log probs -- get log probabilities from logits, process logits with processors (*e.g.*
             # `temperature`, ...), and add new logprobs to existing running logprobs scores.
@@ -3456,6 +3477,9 @@ class GenerationMixin(ContinuousMixin):
             if any(cache_key in model_kwargs for cache_key in ALL_CACHE_NAMES):
                 cache_key = next(cache_key for cache_key in ALL_CACHE_NAMES if cache_key in model_kwargs)
                 beam_idx = self._flatten_beam_dim(running_beam_indices[..., cur_len - decoder_prompt_len])
+                if shared_prefill:
+                    beam_idx = beam_idx // num_beams
+                    shared_prefill = False
                 if hasattr(self, "_reorder_cache"):
                     model_kwargs[cache_key] = self._reorder_cache(model_kwargs[cache_key], beam_idx)
                 elif hasattr(model_kwargs[cache_key], "reorder_cache"):
