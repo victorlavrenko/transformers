@@ -1,0 +1,52 @@
+name: Disable inherited Actions in fork
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/disable-fork-actions.yml
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  disable:
+    name: Disable all workflows
+    if: github.repository == 'victorlavrenko/transformers'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disable every workflow in this fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          current="${GITHUB_WORKFLOW_REF#${GITHUB_REPOSITORY}/}"
+          current="${current%@*}"
+          self_id=""
+
+          mapfile -t workflows < <(
+            gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+              --jq '.workflows[] | [.id, .path] | @tsv'
+          )
+
+          for workflow in "${workflows[@]}"; do
+            IFS=$'\t' read -r id path <<< "$workflow"
+
+            if [[ "$path" == "$current" ]]; then
+              self_id="$id"
+              continue
+            fi
+
+            echo "Disabling $path"
+            gh api --method PUT "/repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable"
+          done
+
+          if [[ -n "$self_id" ]]; then
+            echo "Disabling $current"
+            gh api --method PUT "/repos/${GITHUB_REPOSITORY}/actions/workflows/${self_id}/disable"
+          fi
